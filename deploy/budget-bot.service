@@ -1,0 +1,17 @@
+[Unit]
+Description=Budget Tracker Telegram Bot
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/budget-tracker
+EnvironmentFile=/opt/budget-tracker/.env
+ExecStart=/opt/budget-tracker/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

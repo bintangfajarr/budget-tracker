@@ -1,0 +1,17 @@
+[Unit]
+Description=Budget Tracker Dashboard API
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/budget-tracker
+EnvironmentFile=/opt/budget-tracker/.env
+ExecStart=/opt/budget-tracker/venv/bin/uvicorn api:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
