@@ -39,6 +39,31 @@ if [ ! -f .env ]; then
   exit 1
 fi
 
+echo "==> Installing Ollama..."
+if ! command -v ollama &> /dev/null; then
+  curl -fsSL https://ollama.com/install.sh | sh
+else
+  echo "    Ollama already installed, skipping."
+fi
+
+# Enable & start Ollama as a systemd service
+sudo systemctl enable ollama
+sudo systemctl start ollama
+
+# Wait for Ollama to be ready
+echo "    Waiting for Ollama to start..."
+for i in {1..15}; do
+  if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
+    echo "    Ollama is ready."
+    break
+  fi
+  sleep 2
+done
+
+echo "==> Pulling Nous Hermes 2 Mistral 7B model..."
+echo "    (This may take 5-10 minutes on first run, ~5GB download)"
+ollama pull nous-hermes2-mistral
+
 echo "==> Building frontend..."
 cd dashboard/frontend
 npm ci
@@ -76,6 +101,10 @@ sudo nginx -t && sudo systemctl restart nginx
 
 echo ""
 echo "==> Deployment selesai!"
-echo "    Bot status : sudo systemctl status budget-bot"
-echo "    API status : sudo systemctl status budget-api"
-echo "    Dashboard  : http://$(curl -s ifconfig.me)"
+echo "    Bot status    : sudo systemctl status budget-bot"
+echo "    API status    : sudo systemctl status budget-api"
+echo "    Ollama status : sudo systemctl status ollama"
+echo "    Dashboard     : http://$(curl -s ifconfig.me)"
+echo ""
+echo "    Model Hermes tersedia di: http://localhost:11434"
+echo "    Cek kategorisasi AI: ollama run nous-hermes2-mistral"

@@ -271,15 +271,19 @@ async def ask_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ask_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["tx_description"] = update.message.text.strip()
 
-    auto = auto_categorize(context.user_data["tx_description"])
-    cats = get_all_categories()
+    tx_type = context.user_data["tx_type"]
+    description = context.user_data["tx_description"]
 
-    is_income = context.user_data["tx_type"] == "credit"
+    # Try AI categorization (keyword → Hermes fallback)
+    auto = auto_categorize(description, tx_type=tx_type)
+
+    cats = get_all_categories()
+    is_income = tx_type == "credit"
     filtered = [c for c in cats if c["is_income"] == is_income]
 
     buttons = [[InlineKeyboardButton(f"{c['emoji']} {c['name']}", callback_data=f"cat:{c['id']}")] for c in filtered]
 
-    hint = f"\n\n💡 Rekomendasi: *{auto}*" if auto else ""
+    hint = f"\n\n🤖 Rekomendasi AI: *{auto}*" if auto else ""
     await update.message.reply_text(
         f"Pilih kategori:{hint}",
         reply_markup=InlineKeyboardMarkup(buttons),

@@ -45,8 +45,12 @@ async def _poll_emails():
         if uid and email_uid_exists(uid):
             continue
 
-        # Auto-categorize
-        cat_name = auto_categorize(tx.get("description", ""), tx.get("merchant"))
+        # Auto-categorize: keyword matching → Hermes AI → None
+        cat_name = auto_categorize(
+            tx.get("description", ""),
+            tx.get("merchant"),
+            tx_type=tx.get("type", "debit"),
+        )
         cat_id = categories.get(cat_name) if cat_name else None
 
         row = insert_transaction({
