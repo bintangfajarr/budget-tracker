@@ -25,3 +25,26 @@ export const createTransaction = (data: object) =>
 
 export const patchCategory = (tx_id: number, category_id: number) =>
   api.patch(`/transactions/${tx_id}/category`, { category_id })
+
+// ─── Notes & Calendar ────────────────────────────────────────────────────────
+
+export const getCalendarMonth = (year: number, month: number) =>
+  api.get(`/calendar/${year}/${month}`).then(r => r.data)
+
+export const getCalendarYear = (year: number) =>
+  api.get(`/calendar/${year}`).then(r => r.data)
+
+export const getNotes = (params: { day?: string; start?: string; end?: string; q?: string } = {}) =>
+  api.get('/notes', { params }).then(r => r.data)
+
+export const createNote = (data: object) =>
+  api.post('/notes', data).then(r => r.data)
+
+export const patchNote = (id: number, data: object) =>
+  api.patch(`/notes/${id}`, data).then(r => r.data)
+
+export const deleteNote = (id: number) =>
+  api.delete(`/notes/${id}`).then(r => r.data)
+
+export const getNoteTags = () =>
+  api.get('/notes-tags').then(r => r.data)

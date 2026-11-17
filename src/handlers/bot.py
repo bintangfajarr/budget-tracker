@@ -11,10 +11,14 @@ Commands:
   /setbudget    - Set budget kategori
   /kategori     - Daftar kategori
   /bantuan      - Help
+  /catat        - Catat cepat atau terpandu
+  /catatan      - Lihat / cari catatan
+  /harini       - Catatan hari ini
+  /hapuscatatan - Hapus catatan by id
 """
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from telegram import (
     Update,
@@ -34,6 +38,12 @@ from telegram.ext import (
 )
 
 from src.models.database import (
+    insert_note,
+    get_notes_by_date,
+    get_notes_range,
+    get_month_calendar,
+    search_notes,
+    delete_note,
     get_all_categories,
     get_category_by_id,
     get_summary,
@@ -52,7 +62,8 @@ logger = logging.getLogger(__name__)
 (
     ASK_TYPE, ASK_AMOUNT, ASK_DESCRIPTION, ASK_CATEGORY, ASK_DATE,
     BUD_CATEGORY, BUD_AMOUNT,
-) = range(7)
+    NOTE_BODY, NOTE_MOOD, NOTE_TAGS,
+) = range(10)
 
 
 def _allowed(user_id: int) -> bool:
@@ -352,6 +363,227 @@ def make_email_notify(app: Application, allowed_ids: list[int]):
     return notify
 
 
+
+# ─── Notes ───────────────────────────────────────────────────────────────────
+# These handlers send PLAIN TEXT on purpose. Note bodies are free-form user
+# input and will contain MarkdownV2 reserved characters constantly; one missed
+# escape would make Telegram reject the entire message.
+
+_MOOD_EMOJI = {"good": "\U0001F600", "ok": "\U0001F610", "bad": "\U0001F615"}
+_MOOD_WORD = {"good": "baik", "ok": "biasa", "bad": "buruk"}
+
+
+def _fmt_note_plain(n: dict, with_date: bool = False) -> str:
+    """Render one note as plain text."""
+    head = []
+    if with_date:
+        head.append(str(n["note_date"]))
+    if n.get("mood"):
+        head.append(_MOOD_EMOJI.get(n["mood"], ""))
+    if n.get("title"):
+        head.append(n["title"])
+
+    lines = []
+    if head:
+        lines.append(" ".join(x for x in head if x))
+    lines.append(n["body"])
+
+    meta = []
+    if n.get("tags"):
+        meta.append(" ".join("#" + t for t in n["tags"]))
+    meta.append("id:" + str(n["id"]))
+    lines.append("   ".join(meta))
+
+    return "\n".join(lines)
+
+
+@_auth
+async def cmd_catat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /catat <teks>   catat cepat untuk hari ini
+    /catat          mode terpandu
+    """
+    uid = update.effective_user.id
+    text = " ".join(context.args).strip() if context.args else ""
+
+    if not text:
+        await update.message.reply_text(
+            "Tulis catatanmu sekarang.\n\nKirim /batal untuk membatalkan."
+        )
+        return NOTE_BODY
+
+    # inline #tags are lifted out into real tags
+    tags = [w[1:] for w in text.split() if w.startswith("#") and len(w) > 1]
+    body = " ".join(w for w in text.split() if not w.startswith("#")).strip() or text
+
+    note = insert_note({
+        "note_date": datetime.now().date(),
+        "title": None,
+        "body": body,
+        "mood": None,
+        "tags": tags,
+        "source": "telegram",
+        "telegram_user_id": uid,
+    })
+    await update.message.reply_text(
+        "Catatan disimpan.\n\n" + _fmt_note_plain(note)
+    )
+    return ConversationHandler.END
+
+
+@_auth
+async def note_got_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["note_body"] = update.message.text.strip()
+    kb = ReplyKeyboardMarkup(
+        [["Baik", "Biasa", "Buruk"], ["Lewati"]],
+        one_time_keyboard=True,
+        resize_keyboard=True,
+    )
+    await update.message.reply_text("Bagaimana perasaanmu? Pilih atau Lewati.", reply_markup=kb)
+    return NOTE_MOOD
+
+
+@_auth
+async def note_got_mood(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip().lower()
+    mood = None
+    if raw.startswith("baik"):
+        mood = "good"
+    elif raw.startswith("biasa"):
+        mood = "ok"
+    elif raw.startswith("buruk"):
+        mood = "bad"
+    context.user_data["note_mood"] = mood
+
+    await update.message.reply_text(
+        "Tambahkan tag? Pisahkan dengan koma.\n\nKirim - untuk melewati.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return NOTE_TAGS
+
+
+@_auth
+async def note_got_tags(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip()
+    tags = [] if raw in ("-", "") else [t.strip() for t in raw.split(",") if t.strip()]
+
+    note = insert_note({
+        "note_date": datetime.now().date(),
+        "title": None,
+        "body": context.user_data.get("note_body", ""),
+        "mood": context.user_data.get("note_mood"),
+        "tags": tags,
+        "source": "telegram",
+        "telegram_user_id": update.effective_user.id,
+    })
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        "Catatan disimpan.\n\n" + _fmt_note_plain(note)
+    )
+    return ConversationHandler.END
+
+
+@_auth
+async def cmd_catatan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /catatan                 7 hari terakhir
+    /catatan 2026-11-17      tanggal tertentu
+    /catatan cari <kata>     pencarian
+    """
+    uid = update.effective_user.id
+    args = context.args or []
+
+    if args and args[0].lower() in ("cari", "search"):
+        q = " ".join(args[1:]).strip()
+        if not q:
+            await update.message.reply_text("Contoh: /catatan cari rapat")
+            return
+        rows = search_notes(q, limit=15, telegram_user_id=uid)
+        header = "Hasil untuk '" + q + "' (" + str(len(rows)) + ")"
+        with_date = True
+
+    elif args:
+        try:
+            d = datetime.strptime(args[0], "%Y-%m-%d").date()
+        except ValueError:
+            await update.message.reply_text("Format tanggal salah. Gunakan YYYY-MM-DD")
+            return
+        rows = get_notes_by_date(d, telegram_user_id=uid)
+        header = str(d) + " (" + str(len(rows)) + " catatan)"
+        with_date = False
+
+    else:
+        end = datetime.now().date()
+        start = end - timedelta(days=6)
+        rows = get_notes_range(start, end, telegram_user_id=uid)
+        header = "7 hari terakhir (" + str(len(rows)) + " catatan)"
+        with_date = True
+
+    if not rows:
+        await update.message.reply_text(header + "\n\nBelum ada catatan.")
+        return
+
+    parts = [header, ""]
+    for n in rows[:15]:
+        parts.append(_fmt_note_plain(n, with_date=with_date))
+        parts.append("")
+
+    if len(rows) > 15:
+        parts.append("... dan " + str(len(rows) - 15) + " lainnya")
+
+    await update.message.reply_text("\n".join(parts))
+
+
+@_auth
+async def cmd_harini(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catatan hari ini plus rekap bulan ini."""
+    uid = update.effective_user.id
+    today = datetime.now().date()
+
+    rows = get_notes_by_date(today, telegram_user_id=uid)
+    cal = get_month_calendar(today.year, today.month, telegram_user_id=uid)
+    days_with = sum(1 for r in cal if r["note_count"] > 0)
+    total = sum(r["note_count"] for r in cal)
+
+    parts = [
+        str(today),
+        "",
+        "Catatan hari ini: " + str(len(rows)),
+        "Bulan ini: " + str(total) + " catatan dalam " + str(days_with) + " hari",
+        "",
+    ]
+    if rows:
+        for n in rows:
+            parts.append(_fmt_note_plain(n))
+            parts.append("")
+    else:
+        parts.append("Belum ada catatan hari ini. Gunakan /catat untuk menambah.")
+
+    await update.message.reply_text("\n".join(parts))
+
+
+@_auth
+async def cmd_hapuscatatan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/hapuscatatan <id>"""
+    if not context.args:
+        await update.message.reply_text(
+            "Contoh: /hapuscatatan 12\n\nID terlihat di baris terakhir setiap catatan."
+        )
+        return
+    try:
+        note_id = int(context.args[0].lstrip("#").replace("id:", ""))
+    except ValueError:
+        await update.message.reply_text("ID harus berupa angka.")
+        return
+
+    ok = delete_note(note_id)
+    if ok:
+        await update.message.reply_text("Catatan id:" + str(note_id) + " dihapus.")
+    else:
+        await update.message.reply_text("Catatan id:" + str(note_id) + " tidak ditemukan.")
+
+
 # ─── Build Application ────────────────────────────────────────────────────────
 
 def build_application() -> Application:
@@ -388,7 +620,21 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("minggu", cmd_minggu))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
     app.add_handler(CommandHandler("budget", cmd_budget))
+    catat_conv = ConversationHandler(
+        entry_points=[CommandHandler("catat", cmd_catat)],
+        states={
+            NOTE_BODY: [MessageHandler(filters.TEXT & ~filters.COMMAND, note_got_body)],
+            NOTE_MOOD: [MessageHandler(filters.TEXT & ~filters.COMMAND, note_got_mood)],
+            NOTE_TAGS: [MessageHandler(filters.TEXT & ~filters.COMMAND, note_got_tags)],
+        },
+        fallbacks=[CommandHandler("batal", cancel)],
+    )
+
+    app.add_handler(CommandHandler("catatan", cmd_catatan))
+    app.add_handler(CommandHandler("harini", cmd_harini))
+    app.add_handler(CommandHandler("hapuscatatan", cmd_hapuscatatan))
     app.add_handler(tambah_conv)
     app.add_handler(setbudget_conv)
+    app.add_handler(catat_conv)
 
     return app

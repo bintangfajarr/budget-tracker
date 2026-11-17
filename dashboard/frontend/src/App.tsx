@@ -2,12 +2,14 @@ import { BrowserRouter, NavLink, Route, Routes } from 'react-router-dom'
 import Dashboard from './pages/Dashboard'
 import Transactions from './pages/Transactions'
 import Budget from './pages/Budget'
-import { LayoutDashboard, List, PiggyBank } from 'lucide-react'
+import Calendar from './pages/Calendar'
+import { LayoutDashboard, List, PiggyBank, NotebookPen } from 'lucide-react'
 
 const nav = [
   { to: '/', label: 'Dashboard', icon: LayoutDashboard },
   { to: '/transactions', label: 'Transaksi', icon: List },
   { to: '/budget', label: 'Budget', icon: PiggyBank },
+  { to: '/notes', label: 'Catatan', icon: NotebookPen },
 ]
 
 export default function App() {
@@ -40,6 +42,7 @@ export default function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/transactions" element={<Transactions />} />
             <Route path="/budget" element={<Budget />} />
+            <Route path="/notes" element={<Calendar />} />
           </Routes>
         </main>
       </div>

@@ -70,6 +70,24 @@ CREATE TABLE IF NOT EXISTS settings (
     key         VARCHAR(100) PRIMARY KEY,
     value       TEXT
 );
+
+CREATE TABLE IF NOT EXISTS notes (
+    id          SERIAL PRIMARY KEY,
+    note_date   DATE         NOT NULL,
+    title       VARCHAR(200),
+    body        TEXT         NOT NULL,
+    mood        VARCHAR(20),              -- optional: good | ok | bad
+    tags        TEXT[]       NOT NULL DEFAULT '{}',
+    source      VARCHAR(20)  NOT NULL DEFAULT 'web',   -- web | telegram
+    telegram_user_id BIGINT,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_notes_date ON notes(note_date DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_user ON notes(telegram_user_id);
+CREATE INDEX IF NOT EXISTS idx_notes_tags ON notes USING GIN(tags);
+
 """
 
 DEFAULT_CATEGORIES = [
@@ -223,6 +241,219 @@ def get_budgets_vs_actual(telegram_user_id: int) -> list[dict]:
             WHERE b.month = DATE_TRUNC('month', NOW())
             GROUP BY c.name, c.emoji, b.amount
             ORDER BY (COALESCE(SUM(t.amount), 0)::float / b.amount) DESC
+            """,
+            {"uid": telegram_user_id},
+        )
+        return cur.fetchall()
+
+
+# ─── Notes ───────────────────────────────────────────────────────────────────
+
+def insert_note(data: dict) -> dict:
+    """Create a note. `data` keys: note_date, title, body, mood, tags,
+    source, telegram_user_id."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO notes
+                (note_date, title, body, mood, tags, source, telegram_user_id)
+            VALUES
+                (%(note_date)s, %(title)s, %(body)s, %(mood)s,
+                 %(tags)s, %(source)s, %(telegram_user_id)s)
+            RETURNING *
+            """,
+            data,
+        )
+        return cur.fetchone()
+
+
+def update_note(note_id: int, data: dict) -> dict | None:
+    """Patch a note. Only the keys present in `data` are written."""
+    allowed = ("note_date", "title", "body", "mood", "tags")
+    sets, params = [], {"id": note_id}
+    for k in allowed:
+        if k in data:
+            sets.append(f"{k} = %({k})s")
+            params[k] = data[k]
+    if not sets:
+        return get_note(note_id)
+
+    sets.append("updated_at = NOW()")
+    with db_cursor() as cur:
+        cur.execute(
+            f"UPDATE notes SET {', '.join(sets)} WHERE id = %(id)s RETURNING *",
+            params,
+        )
+        return cur.fetchone()
+
+
+def delete_note(note_id: int) -> bool:
+    with db_cursor() as cur:
+        cur.execute("DELETE FROM notes WHERE id = %s RETURNING id", (note_id,))
+        return cur.fetchone() is not None
+
+
+def get_note(note_id: int) -> dict | None:
+    with db_cursor() as cur:
+        cur.execute("SELECT * FROM notes WHERE id = %s", (note_id,))
+        return cur.fetchone()
+
+
+def get_notes_by_date(note_date, telegram_user_id: int = None) -> list[dict]:
+    """All notes for one specific day."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT * FROM notes
+            WHERE note_date = %(d)s
+              AND (%(uid)s IS NULL OR telegram_user_id = %(uid)s)
+            ORDER BY created_at ASC
+            """,
+            {"d": note_date, "uid": telegram_user_id},
+        )
+        return cur.fetchall()
+
+
+def get_notes_range(start, end, telegram_user_id: int = None) -> list[dict]:
+    """All notes between two dates, inclusive."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT * FROM notes
+            WHERE note_date BETWEEN %(s)s AND %(e)s
+              AND (%(uid)s IS NULL OR telegram_user_id = %(uid)s)
+            ORDER BY note_date DESC, created_at ASC
+            """,
+            {"s": start, "e": end, "uid": telegram_user_id},
+        )
+        return cur.fetchall()
+
+
+def get_month_calendar(year: int, month: int, telegram_user_id: int = None) -> list[dict]:
+    """
+    Per-day rollup for one month: note count, moods, and the money moved
+    that day. Drives the calendar grid.
+    """
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            WITH days AS (
+                SELECT generate_series(
+                    make_date(%(y)s, %(m)s, 1),
+                    (make_date(%(y)s, %(m)s, 1) + INTERVAL '1 month - 1 day')::date,
+                    '1 day'
+                )::date AS d
+            ),
+            n AS (
+                SELECT note_date AS d,
+                       COUNT(*) AS note_count,
+                       ARRAY_REMOVE(ARRAY_AGG(DISTINCT mood), NULL) AS moods,
+                       (ARRAY_AGG(COALESCE(NULLIF(title,''), LEFT(body, 60))
+                                  ORDER BY created_at))[1] AS first_title
+                FROM notes
+                WHERE note_date >= make_date(%(y)s, %(m)s, 1)
+                  AND note_date <  make_date(%(y)s, %(m)s, 1) + INTERVAL '1 month'
+                  AND (%(uid)s IS NULL OR telegram_user_id = %(uid)s)
+                GROUP BY note_date
+            ),
+            t AS (
+                SELECT DATE(transaction_at) AS d,
+                       COUNT(*) AS tx_count,
+                       COALESCE(SUM(CASE WHEN type='debit'  THEN amount END), 0) AS spent,
+                       COALESCE(SUM(CASE WHEN type='credit' THEN amount END), 0) AS received
+                FROM transactions
+                WHERE transaction_at >= make_date(%(y)s, %(m)s, 1)
+                  AND transaction_at <  make_date(%(y)s, %(m)s, 1) + INTERVAL '1 month'
+                GROUP BY DATE(transaction_at)
+            )
+            SELECT days.d AS date,
+                   COALESCE(n.note_count, 0) AS note_count,
+                   COALESCE(n.moods, '{}') AS moods,
+                   n.first_title,
+                   COALESCE(t.tx_count, 0) AS tx_count,
+                   COALESCE(t.spent, 0) AS spent,
+                   COALESCE(t.received, 0) AS received
+            FROM days
+            LEFT JOIN n ON n.d = days.d
+            LEFT JOIN t ON t.d = days.d
+            ORDER BY days.d
+            """,
+            {"y": year, "m": month, "uid": telegram_user_id},
+        )
+        return cur.fetchall()
+
+
+def get_year_calendar(year: int, telegram_user_id: int = None) -> list[dict]:
+    """Per-month rollup for a whole year."""
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            WITH months AS (
+                SELECT generate_series(
+                    make_date(%(y)s, 1, 1),
+                    make_date(%(y)s, 12, 1),
+                    '1 month'
+                )::date AS m
+            ),
+            n AS (
+                SELECT DATE_TRUNC('month', note_date)::date AS m,
+                       COUNT(*) AS note_count,
+                       COUNT(DISTINCT note_date) AS days_with_notes
+                FROM notes
+                WHERE EXTRACT(YEAR FROM note_date) = %(y)s
+                  AND (%(uid)s IS NULL OR telegram_user_id = %(uid)s)
+                GROUP BY 1
+            ),
+            t AS (
+                SELECT DATE_TRUNC('month', transaction_at)::date AS m,
+                       COUNT(*) AS tx_count,
+                       COALESCE(SUM(CASE WHEN type='debit'  THEN amount END), 0) AS spent,
+                       COALESCE(SUM(CASE WHEN type='credit' THEN amount END), 0) AS received
+                FROM transactions
+                WHERE EXTRACT(YEAR FROM transaction_at) = %(y)s
+                GROUP BY 1
+            )
+            SELECT months.m AS month,
+                   EXTRACT(MONTH FROM months.m)::int AS month_num,
+                   COALESCE(n.note_count, 0) AS note_count,
+                   COALESCE(n.days_with_notes, 0) AS days_with_notes,
+                   COALESCE(t.tx_count, 0) AS tx_count,
+                   COALESCE(t.spent, 0) AS spent,
+                   COALESCE(t.received, 0) AS received
+            FROM months
+            LEFT JOIN n ON n.m = months.m
+            LEFT JOIN t ON t.m = months.m
+            ORDER BY months.m
+            """,
+            {"y": year, "uid": telegram_user_id},
+        )
+        return cur.fetchall()
+
+
+def search_notes(q: str, limit: int = 50, telegram_user_id: int = None) -> list[dict]:
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT * FROM notes
+            WHERE (title ILIKE %(q)s OR body ILIKE %(q)s OR %(raw)s = ANY(tags))
+              AND (%(uid)s IS NULL OR telegram_user_id = %(uid)s)
+            ORDER BY note_date DESC, created_at DESC
+            LIMIT %(lim)s
+            """,
+            {"q": f"%{q}%", "raw": q, "lim": limit, "uid": telegram_user_id},
+        )
+        return cur.fetchall()
+
+
+def get_all_tags(telegram_user_id: int = None) -> list[dict]:
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT tag, COUNT(*) AS count
+            FROM notes, UNNEST(tags) AS tag
+            WHERE (%(uid)s IS NULL OR telegram_user_id = %(uid)s)
+            GROUP BY tag
+            ORDER BY count DESC, tag ASC
             """,
             {"uid": telegram_user_id},
         )
