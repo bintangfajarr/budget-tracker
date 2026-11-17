@@ -1,10 +1,10 @@
 """
-AI Categorizer menggunakan Nous Hermes 2 Mistral 7B via Ollama.
+AI Categorizer menggunakan OmniRoute (OpenAI-compatible gateway).
 
 Strategi:
   1. Coba keyword matching dulu (cepat, gratis, offline)
-  2. Kalau tidak ada match → kirim ke Hermes via Ollama API
-  3. Kalau Ollama tidak tersedia → fallback ke "Lain-lain"
+  2. Kalau tidak ada match → kirim ke OmniRoute (model gratis)
+  3. Kalau OmniRoute tidak tersedia → fallback ke None
 """
 import json
 import logging
@@ -46,11 +46,16 @@ VALID_CATEGORIES = [
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-OLLAMA_BASE_URL = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL    = os.environ.get("OLLAMA_MODEL", "nous-hermes2-mistral")
-OLLAMA_TIMEOUT  = int(os.environ.get("OLLAMA_TIMEOUT", "15"))  # seconds
+OMNIROUTE_BASE_URL = os.environ.get("OMNIROUTE_BASE_URL", "http://127.0.0.1:20128/v1")
+OMNIROUTE_API_KEY  = os.environ.get("OMNIROUTE_API_KEY", "")
+OMNIROUTE_MODEL    = os.environ.get("OMNIROUTE_MODEL", "openrouter/cohere/north-mini-code:free")
+OMNIROUTE_TIMEOUT  = int(os.environ.get("OMNIROUTE_TIMEOUT", "30"))  # seconds
 
-# Set False untuk disable Ollama dan hanya pakai keyword
+# Reasoning models need room to think before emitting the answer; too low a
+# value returns content=None with the answer stranded in `reasoning`.
+OMNIROUTE_MAX_TOKENS = int(os.environ.get("OMNIROUTE_MAX_TOKENS", "800"))
+
+# Set False untuk disable AI dan hanya pakai keyword
 AI_ENABLED = os.environ.get("AI_CATEGORIZE", "true").lower() == "true"
 
 
@@ -76,45 +81,81 @@ Jawab HANYA dengan nama kategori, tanpa penjelasan tambahan apapun.\
 """
 
 
-def _call_ollama(description: str, tx_type: str = "debit") -> str | None:
+def _call_omniroute(description: str, tx_type: str = "debit") -> str | None:
     """
-    Call Ollama Hermes API. Returns category name or None on failure.
+    Call OmniRoute (OpenAI-compatible) for categorization.
+    Returns the raw model string, or None on failure.
+
     Uses synchronous urllib to avoid extra dependencies.
     """
     direction = "pengeluaran" if tx_type == "debit" else "pemasukan"
     user_msg = f'Kategorikan transaksi {direction} ini: "{description}"'
 
     payload = json.dumps({
-        "model": OLLAMA_MODEL,
+        "model": OMNIROUTE_MODEL,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user",   "content": user_msg},
         ],
-        "stream": False,
-        "options": {
-            "temperature": 0.1,   # Low temp → consistent, deterministic output
-            "num_predict": 20,    # Max tokens — category names are short
-        },
+        "temperature": 0.1,
+        "max_tokens": OMNIROUTE_MAX_TOKENS,
     }).encode()
 
+    headers = {"Content-Type": "application/json"}
+    if OMNIROUTE_API_KEY:
+        headers["Authorization"] = f"Bearer {OMNIROUTE_API_KEY}"
+
     req = urllib.request.Request(
-        f"{OLLAMA_BASE_URL}/api/chat",
+        f"{OMNIROUTE_BASE_URL}/chat/completions",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=OMNIROUTE_TIMEOUT) as resp:
             body = json.loads(resp.read())
-            raw = body["message"]["content"].strip()
-            return raw
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        logger.warning(f"OmniRoute HTTP {e.code}: {detail}")
+        return None
     except urllib.error.URLError as e:
-        logger.warning(f"Ollama unreachable: {e}")
+        logger.warning(f"OmniRoute unreachable: {e}")
         return None
     except Exception as e:
-        logger.warning(f"Ollama call failed: {e}")
+        logger.warning(f"OmniRoute call failed: {e}")
         return None
+
+    try:
+        msg = body["choices"][0]["message"]
+    except (KeyError, IndexError):
+        logger.warning(f"OmniRoute returned no choices: {str(body)[:200]}")
+        return None
+
+    # Preferred: plain content.
+    content = msg.get("content")
+    if content and content.strip():
+        return content.strip()
+
+    # Reasoning models (nemotron, ling, ...) may leave content empty and put
+    # the answer in `reasoning` / `reasoning_content`. Use the tail, since the
+    # conclusion lands at the end.
+    for key in ("reasoning", "reasoning_content"):
+        alt = msg.get(key)
+        if alt and str(alt).strip():
+            logger.debug(f"using '{key}' fallback for categorization")
+            return str(alt).strip()[-300:]
+
+    logger.warning("OmniRoute returned empty content and no reasoning")
+    return None
+
+
+# Backwards-compatible alias: older code/tests may still call _call_ollama.
+_call_ollama = _call_omniroute
 
 
 def _normalize_ai_response(raw: str) -> str | None:
@@ -173,15 +214,15 @@ def auto_categorize(
     if not label.strip():
         return None
 
-    logger.debug(f"Sending to Hermes: '{label[:80]}'")
-    raw = _call_ollama(label, tx_type)
+    logger.debug(f"Sending to OmniRoute: '{label[:80]}'")
+    raw = _call_omniroute(label, tx_type)
     if raw is None:
         return None
 
     result = _normalize_ai_response(raw)
     if result:
-        logger.info(f"Hermes categorized '{label[:50]}' → {result}")
+        logger.info(f"OmniRoute categorized '{label[:50]}' → {result}")
     else:
-        logger.warning(f"Hermes returned unrecognized category: '{raw}' for '{label[:50]}'")
+        logger.warning(f"OmniRoute returned unrecognized category: '{raw}' for '{label[:50]}'")
 
     return result
