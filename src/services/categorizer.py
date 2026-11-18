@@ -51,6 +51,13 @@ OMNIROUTE_API_KEY  = os.environ.get("OMNIROUTE_API_KEY", "")
 OMNIROUTE_MODEL    = os.environ.get("OMNIROUTE_MODEL", "openrouter/cohere/north-mini-code:free")
 OMNIROUTE_TIMEOUT  = int(os.environ.get("OMNIROUTE_TIMEOUT", "30"))  # seconds
 
+# Fallback endpoint, tried only when the primary fails. The free tier has a
+# daily request cap, so one exhausted quota would otherwise leave every
+# transaction uncategorised for the rest of the day.
+FALLBACK_BASE_URL = os.environ.get("FALLBACK_BASE_URL", "")
+FALLBACK_API_KEY  = os.environ.get("FALLBACK_API_KEY", "")
+FALLBACK_MODEL    = os.environ.get("FALLBACK_MODEL", "")
+
 # Reasoning models need room to think before emitting the answer; too low a
 # value returns content=None with the answer stranded in `reasoning`.
 OMNIROUTE_MAX_TOKENS = int(os.environ.get("OMNIROUTE_MAX_TOKENS", "800"))
@@ -81,76 +88,145 @@ Jawab HANYA dengan nama kategori, tanpa penjelasan tambahan apapun.\
 """
 
 
-def _call_omniroute(description: str, tx_type: str = "debit") -> str | None:
+def _endpoint_chain() -> list[tuple[str, str, str, str]]:
     """
-    Call OmniRoute (OpenAI-compatible) for categorization.
-    Returns the raw model string, or None on failure.
+    (label, base_url, api_key, model) in the order they should be tried.
+    The fallback is included only when fully configured.
+    """
+    chain = [("primary", OMNIROUTE_BASE_URL, OMNIROUTE_API_KEY, OMNIROUTE_MODEL)]
+    if FALLBACK_BASE_URL and FALLBACK_MODEL:
+        chain.append(("fallback", FALLBACK_BASE_URL, FALLBACK_API_KEY, FALLBACK_MODEL))
+    return chain
 
-    Uses synchronous urllib to avoid extra dependencies.
+
+def _post_once(base_url: str, api_key: str, model: str,
+               description: str, tx_type: str) -> tuple[str | None, str | None]:
+    """
+    One attempt. Returns (raw_text, error). Exactly one is non-None.
+
+    `error` is a short machine-ish reason so the caller can decide whether
+    moving to the next endpoint is worthwhile.
     """
     direction = "pengeluaran" if tx_type == "debit" else "pemasukan"
     user_msg = f'Kategorikan transaksi {direction} ini: "{description}"'
 
     payload = json.dumps({
-        "model": OMNIROUTE_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user",   "content": user_msg},
         ],
         "temperature": 0.1,
         "max_tokens": OMNIROUTE_MAX_TOKENS,
+        "stream": False,
     }).encode()
 
-    headers = {"Content-Type": "application/json"}
-    if OMNIROUTE_API_KEY:
-        headers["Authorization"] = f"Bearer {OMNIROUTE_API_KEY}"
+    # Some gateways sit behind Cloudflare and reject python-urllib's default
+    # User-Agent with a 1010 challenge, so send an explicit one.
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "budget-tracker/1.0",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
-    req = urllib.request.Request(
-        f"{OMNIROUTE_BASE_URL}/chat/completions",
-        data=payload,
-        headers=headers,
-        method="POST",
-    )
+    # A base_url already ending in /chat/completions is used verbatim; this
+    # lets the fallback point at a local shim that exposes a bare root path.
+    base = base_url.rstrip("/")
+    url = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+
+    req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
 
     try:
         with urllib.request.urlopen(req, timeout=OMNIROUTE_TIMEOUT) as resp:
-            body = json.loads(resp.read())
+            raw = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
         detail = ""
         try:
-            detail = e.read().decode("utf-8", "replace")[:200]
+            detail = e.read().decode("utf-8", "replace")[:160]
         except Exception:
             pass
-        logger.warning(f"OmniRoute HTTP {e.code}: {detail}")
-        return None
+        return None, f"http_{e.code}: {detail}"
     except urllib.error.URLError as e:
-        logger.warning(f"OmniRoute unreachable: {e}")
-        return None
+        return None, f"unreachable: {e}"
     except Exception as e:
-        logger.warning(f"OmniRoute call failed: {e}")
+        return None, f"failed: {e}"
+
+    return raw, None
+
+
+def _extract_answer(raw: str) -> str | None:
+    """
+    Pull the answer out of either a plain JSON body or an SSE stream.
+
+    Some gateways (z0ne, for one) reply with SSE even when stream:false is
+    requested, so both shapes have to be handled.
+    """
+    text = raw.strip()
+
+    if text.startswith("{"):
+        try:
+            body = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+        try:
+            msg = body["choices"][0]["message"]
+        except (KeyError, IndexError):
+            return None
+        content = msg.get("content")
+        if content and content.strip():
+            return content.strip()
+        for key in ("reasoning", "reasoning_content"):
+            alt = msg.get(key)
+            if alt and str(alt).strip():
+                return str(alt).strip()[-300:]
         return None
 
-    try:
-        msg = body["choices"][0]["message"]
-    except (KeyError, IndexError):
-        logger.warning(f"OmniRoute returned no choices: {str(body)[:200]}")
-        return None
+    # SSE
+    content, reasoning = "", ""
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        chunk = line[5:].strip()
+        if chunk == "[DONE]":
+            break
+        try:
+            ch = json.loads(chunk)
+        except json.JSONDecodeError:
+            continue
+        for choice in ch.get("choices", []):
+            delta = choice.get("delta") or {}
+            if delta.get("content"):
+                content += delta["content"]
+            if delta.get("reasoning_content"):
+                reasoning += delta["reasoning_content"]
 
-    # Preferred: plain content.
-    content = msg.get("content")
-    if content and content.strip():
-        return content.strip()
+    answer = (content or reasoning).strip()
+    return answer[-300:] if answer else None
 
-    # Reasoning models (nemotron, ling, ...) may leave content empty and put
-    # the answer in `reasoning` / `reasoning_content`. Use the tail, since the
-    # conclusion lands at the end.
-    for key in ("reasoning", "reasoning_content"):
-        alt = msg.get(key)
-        if alt and str(alt).strip():
-            logger.debug(f"using '{key}' fallback for categorization")
-            return str(alt).strip()[-300:]
 
-    logger.warning("OmniRoute returned empty content and no reasoning")
+def _call_omniroute(description: str, tx_type: str = "debit") -> str | None:
+    """
+    Ask the model to categorize, walking the endpoint chain on failure.
+    Returns the raw model string, or None when every endpoint failed.
+    """
+    for label, base_url, api_key, model in _endpoint_chain():
+        raw, err = _post_once(base_url, api_key, model, description, tx_type)
+
+        if err:
+            logger.warning("categorizer %s (%s) failed: %s", label, model, err)
+            continue
+
+        answer = _extract_answer(raw)
+        if answer:
+            if label != "primary":
+                logger.info("categorizer used %s (%s)", label, model)
+            return answer
+
+        logger.warning("categorizer %s (%s) returned nothing usable", label, model)
+
     return None
 
 
