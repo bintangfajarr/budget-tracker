@@ -64,7 +64,7 @@ def fmt_transaction(tx: dict) -> str:
     cat = f"{tx.get('category_emoji', '')} {tx.get('category_name', 'Tidak Terkategori')}"
     date = tx["transaction_at"].strftime("%d %b %Y %H:%M") if hasattr(tx["transaction_at"], "strftime") else str(tx["transaction_at"])
     lines = [
-        f"{emoji} *{sign}{fmt_idr(tx['amount'])}*",
+        f"{emoji} *{sign}{fmt_idr(tx['amount'])}*  `id {tx.get('id', '-')}`",
         f"📝 {tx['description']}",
         f"🏷️ {cat}",
         f"📅 {date}",

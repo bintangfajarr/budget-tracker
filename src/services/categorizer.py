@@ -26,9 +26,16 @@ KEYWORD_RULES: list[tuple[re.Pattern, str]] = [
     (re.compile(r"apotik|apotek|klinik|rumah\s*sakit|rs\s|dokter|halodoc|alodokter|kimia\s*farma|century|guardian|obat|vitamin|sehat", re.I), "Kesehatan"),
     (re.compile(r"sekolah|kuliah|kursus|udemy|coursera|ruangguru|zenius|bimbel|buku|gramedia|perpustakaan|spp|ukt|pendidikan", re.I), "Pendidikan"),
     (re.compile(r"investasi|saham|reksa\s*dana|bibit|ajaib|stockbit|bareksa|pluang|emas|logam\s*mulia|deposito|tabungan\s*berjangka", re.I), "Tabungan & Investasi"),
+    # Outgoing first: "transfer to ..." and "transfer ke ..." are debits, and
+    # would otherwise be caught by the incoming rule below on the word alone.
+    (re.compile(r"transfer\s+to\b|transfer\s+ke\b|transfer\s*keluar|outgoing\s*transfer", re.I), "Transfer Keluar"),
     (re.compile(r"transfer\s*masuk|terima\s*transfer|incoming\s*transfer|receive", re.I), "Transfer Masuk"),
     (re.compile(r"gaji|salary|payroll|THR|insentif|bonus", re.I), "Gaji & Pemasukan"),
 ]
+
+# Categories that can only apply to money coming in. Offering them for a debit
+# invites exactly the mistake this fixes.
+_INCOME_ONLY = ("Gaji & Pemasukan", "Transfer Masuk")
 
 VALID_CATEGORIES = [
     "Makanan & Minuman",
@@ -107,8 +114,21 @@ def _post_once(base_url: str, api_key: str, model: str,
     `error` is a short machine-ish reason so the caller can decide whether
     moving to the next endpoint is worthwhile.
     """
-    direction = "pengeluaran" if tx_type == "debit" else "pemasukan"
-    user_msg = f'Kategorikan transaksi {direction} ini: "{description}"'
+    if tx_type == "debit":
+        direction = "PENGELUARAN (uang keluar dari rekening)"
+        excluded = ", ".join(_INCOME_ONLY)
+        rule = (f"Ini transaksi keluar, jadi JANGAN pilih: {excluded}. "
+                f"Kata 'Transfer' di sini berarti mengirim uang, bukan menerima.")
+    else:
+        direction = "PEMASUKAN (uang masuk ke rekening)"
+        rule = "Ini transaksi masuk."
+
+    user_msg = (
+        f"Transaksi: \"{description}\"\n"
+        f"Jenis: {direction}\n"
+        f"{rule}\n"
+        f"Jawab HANYA nama kategori."
+    )
 
     payload = json.dumps({
         "model": model,
@@ -259,6 +279,14 @@ def _normalize_ai_response(raw: str) -> str | None:
 
 # ─── Public API ───────────────────────────────────────────────────────────────
 
+def _reject_impossible(category: str | None, tx_type: str) -> str | None:
+    """Drop a category that cannot apply to this direction."""
+    if category and tx_type == "debit" and category in _INCOME_ONLY:
+        logger.info("rejected %r for a debit transaction", category)
+        return None
+    return category
+
+
 def auto_categorize(
     description: str,
     merchant: str | None = None,
@@ -295,7 +323,7 @@ def auto_categorize(
     if raw is None:
         return None
 
-    result = _normalize_ai_response(raw)
+    result = _reject_impossible(_normalize_ai_response(raw), tx_type)
     if result:
         logger.info(f"OmniRoute categorized '{label[:50]}' → {result}")
     else:

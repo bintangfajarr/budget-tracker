@@ -186,20 +186,54 @@ def get_summary(telegram_user_id: int, period: str = "month") -> list[dict]:
         return cur.fetchall()
 
 
-def get_recent_transactions(telegram_user_id: int, limit: int = 10) -> list[dict]:
+def get_recent_transactions(telegram_user_id: int = None, limit: int = 10) -> list[dict]:
+    """
+    Most recent transactions.
+
+    Email-imported rows have telegram_user_id NULL, since nobody typed them.
+    Filtering strictly on that column hid every imported transaction from the
+    dashboard. Passing None now means "everything", and a user id still
+    includes the imported rows alongside that user's own entries.
+    """
     with db_cursor() as cur:
         cur.execute(
             """
             SELECT t.*, c.name AS category_name, c.emoji AS category_emoji
             FROM transactions t
             LEFT JOIN categories c ON c.id = t.category_id
-            WHERE t.telegram_user_id = %s
+            WHERE %(uid)s IS NULL
+               OR t.telegram_user_id = %(uid)s
+               OR t.telegram_user_id IS NULL
             ORDER BY t.transaction_at DESC
-            LIMIT %s
+            LIMIT %(lim)s
             """,
-            (telegram_user_id, limit),
+            {"uid": telegram_user_id, "lim": limit},
         )
         return cur.fetchall()
+
+
+def delete_transaction(tx_id: int) -> dict | None:
+    """Remove a transaction. Returns the deleted row, or None if absent."""
+    with db_cursor() as cur:
+        cur.execute(
+            "DELETE FROM transactions WHERE id = %s RETURNING *",
+            (tx_id,),
+        )
+        return cur.fetchone()
+
+
+def get_transaction(tx_id: int) -> dict | None:
+    with db_cursor() as cur:
+        cur.execute(
+            """
+            SELECT t.*, c.name AS category_name, c.emoji AS category_emoji
+            FROM transactions t
+            LEFT JOIN categories c ON c.id = t.category_id
+            WHERE t.id = %s
+            """,
+            (tx_id,),
+        )
+        return cur.fetchone()
 
 
 def update_transaction_category(tx_id: int, category_id: int):

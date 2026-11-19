@@ -22,6 +22,8 @@ from src.models.database import (
     set_budget,
     insert_transaction,
     update_transaction_category,
+    delete_transaction,
+    get_transaction,
     email_uid_exists,
     db_cursor,
     insert_note,
@@ -124,6 +126,23 @@ def create_transaction(body: TransactionIn):
 
 class CategoryUpdate(BaseModel):
     category_id: int
+
+
+@app.delete("/api/transactions/{tx_id}")
+def remove_transaction(tx_id: int):
+    """Delete a transaction. Used to clear misparsed imports."""
+    row = delete_transaction(tx_id)
+    if row is None:
+        raise HTTPException(404, "transaction not found")
+    return {"ok": True, "deleted": {"id": row["id"], "amount": row["amount"]}}
+
+
+@app.get("/api/transactions/{tx_id}")
+def read_transaction(tx_id: int):
+    row = get_transaction(tx_id)
+    if row is None:
+        raise HTTPException(404, "transaction not found")
+    return dict(row)
 
 
 @app.patch("/api/transactions/{tx_id}/category")

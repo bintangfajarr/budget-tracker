@@ -48,3 +48,6 @@ export const deleteNote = (id: number) =>
 
 export const getNoteTags = () =>
   api.get('/notes-tags').then(r => r.data)
+
+export const deleteTransaction = (id: number) =>
+  api.delete(`/transactions/${id}`).then(r => r.data)

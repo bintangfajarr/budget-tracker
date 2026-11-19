@@ -38,6 +38,8 @@ from telegram.ext import (
 )
 
 from src.models.database import (
+    delete_transaction,
+    get_transaction,
     insert_note,
     get_notes_by_date,
     get_notes_range,
@@ -122,6 +124,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• /minggu — pengeluaran minggu ini\n"
         "• /ringkasan — pengeluaran bulan ini\n"
         "• /riwayat — 10 transaksi terakhir\n"
+        "• /hapus 12 — hapus transaksi\n"
         "• /budget — pantau budget per kategori\n\n"
         "🏷️ *Kategori:* /kategori untuk melihat semua kategori\\.",
         parse_mode="MarkdownV2",
@@ -364,6 +367,43 @@ def make_email_notify(app: Application, allowed_ids: list[int]):
 
 
 
+
+@_auth
+async def cmd_hapus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /hapus <id>
+
+    Mainly for clearing a misparsed email import: those are noticed from the
+    notification, so they have to be removable from the phone as well as the
+    dashboard. The id is printed by /riwayat.
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "Contoh: /hapus 12\n\nNomor id terlihat di /riwayat."
+        )
+        return
+
+    raw = context.args[0].lstrip("#").replace("id", "").replace(":", "").strip()
+    try:
+        tx_id = int(raw)
+    except ValueError:
+        await update.message.reply_text("ID harus berupa angka. Contoh: /hapus 12")
+        return
+
+    row = get_transaction(tx_id)
+    if row is None:
+        await update.message.reply_text(f"Transaksi id {tx_id} tidak ditemukan.")
+        return
+
+    sign = "-" if row["type"] == "debit" else "+"
+    label = f"{sign}{fmt_idr(row['amount'])} - {row['description']}"
+
+    if delete_transaction(tx_id):
+        await update.message.reply_text(f"Dihapus:\n{label}")
+    else:
+        await update.message.reply_text(f"Gagal menghapus id {tx_id}.")
+
+
 # ─── Notes ───────────────────────────────────────────────────────────────────
 # These handlers send PLAIN TEXT on purpose. Note bodies are free-form user
 # input and will contain MarkdownV2 reserved characters constantly; one missed
@@ -588,7 +628,19 @@ async def cmd_hapuscatatan(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def build_application() -> Application:
     token = os.environ["TELEGRAM_BOT_TOKEN"]
-    app = Application.builder().token(token).build()
+    # Defaults are 5s, which is too tight for this instance: a slow reply
+    # raised TimedOut and the transaction notification was lost even though
+    # the row had already been written.
+    app = (
+        Application.builder()
+        .token(token)
+        .read_timeout(30)
+        .write_timeout(30)
+        .connect_timeout(15)
+        .pool_timeout(15)
+        .get_updates_read_timeout(40)
+        .build()
+    )
 
     # /tambah conversation
     tambah_conv = ConversationHandler(
@@ -619,6 +671,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("hari", cmd_hari))
     app.add_handler(CommandHandler("minggu", cmd_minggu))
     app.add_handler(CommandHandler("riwayat", cmd_riwayat))
+    app.add_handler(CommandHandler("hapus", cmd_hapus))
     app.add_handler(CommandHandler("budget", cmd_budget))
     catat_conv = ConversationHandler(
         entry_points=[CommandHandler("catat", cmd_catat)],

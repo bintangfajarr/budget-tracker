@@ -40,36 +40,59 @@ async def _poll_emails():
 
     categories = {c["name"]: c["id"] for c in get_all_categories()}
 
+    saved = 0
+    skipped = 0
+    failed = 0
+
     for tx in emails:
         uid = tx.get("email_uid")
         if uid and email_uid_exists(uid):
+            skipped += 1
             continue
 
-        # Auto-categorize: keyword matching → Hermes AI → None
-        cat_name = auto_categorize(
-            tx.get("description", ""),
-            tx.get("merchant"),
-            tx_type=tx.get("type", "debit"),
+        # Each email is isolated: a single malformed record must not prevent
+        # the rest of the batch from being imported.
+        try:
+            cat_name = auto_categorize(
+                tx.get("description", ""),
+                tx.get("merchant"),
+                tx_type=tx.get("type", "debit"),
+            )
+            cat_id = categories.get(cat_name) if cat_name else None
+
+            row = insert_transaction({
+                "amount": tx["amount"],
+                "type": tx["type"],
+                "description": tx["description"],
+                "category_id": cat_id,
+                "source": "email",
+                "email_uid": uid,
+                "merchant": tx.get("merchant"),
+                "balance_after": tx.get("balance_after"),
+                "transaction_at": tx.get("transaction_at", datetime.now()),
+                "telegram_user_id": None,
+            })
+        except Exception as e:
+            failed += 1
+            logger.error("could not save %s: %s", uid, e, exc_info=True)
+            continue
+
+        saved += 1
+        logger.info(
+            "saved id=%s amount=%s type=%s cat=%s merchant=%r",
+            row["id"], tx["amount"], tx["type"], cat_name, tx.get("merchant"),
         )
-        cat_id = categories.get(cat_name) if cat_name else None
 
-        row = insert_transaction({
-            "amount": tx["amount"],
-            "type": tx["type"],
-            "description": tx["description"],
-            "category_id": cat_id,
-            "source": "email",
-            "email_uid": uid,
-            "merchant": tx.get("merchant"),
-            "balance_after": tx.get("balance_after"),
-            "transaction_at": tx.get("transaction_at", datetime.now()),
-            "telegram_user_id": None,
-        })
-
-        logger.info(f"Saved email transaction id={row['id']} amount={tx['amount']}")
-
+        # The record is already committed. A notification failure -- Telegram
+        # times out regularly on a small instance -- must not undo that or
+        # stop the remaining emails.
         if _notify_callback:
-            await _notify_callback(row, cat_name)
+            try:
+                await _notify_callback(row, cat_name)
+            except Exception as e:
+                logger.warning("notify failed for id=%s: %s", row["id"], e)
+
+    logger.info("poll finished: saved=%d skipped=%d failed=%d", saved, skipped, failed)
 
 
 def start_scheduler():

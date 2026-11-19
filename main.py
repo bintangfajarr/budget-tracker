@@ -39,7 +39,12 @@ async def main():
     logger.info("Starting Telegram bot polling...")
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(allowed_updates=["message", "callback_query"])
+    await app.updater.start_polling(
+        allowed_updates=["message", "callback_query"],
+        # Releases a long-poll left behind by a previous process; without
+        # this the two instances trade Conflict errors until one dies.
+        drop_pending_updates=True,
+    )
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
     try:
